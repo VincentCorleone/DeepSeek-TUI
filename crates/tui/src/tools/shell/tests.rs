@@ -967,6 +967,24 @@ fn test_orphaned_subprocess_does_not_block_collect_output() {
     assert_eq!(done.status, ShellStatus::Completed);
 }
 
+#[cfg(unix)]
+#[test]
+fn foreground_shell_does_not_block_on_orphaned_subprocess_pipe() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+
+    let started = std::time::Instant::now();
+    let result = manager
+        .execute("sh -c 'sleep 100 &'", None, 5000, false)
+        .expect("foreground execute must complete, not hang");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "foreground execute blocked on descendant pipe handles"
+    );
+    assert_eq!(result.status, ShellStatus::Completed);
+}
+
 // Windows equivalent of the orphaned pipe-handle regression. `cmd /c start /b`
 // launches a descendant process that inherits stdout/stderr and outlives the
 // shell. Job-object cleanup must terminate that descendant before reader-thread

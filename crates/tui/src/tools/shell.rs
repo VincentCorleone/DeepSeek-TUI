@@ -443,6 +443,25 @@ fn spawn_reader_thread<R: Read + Send + 'static>(
     })
 }
 
+const SYNC_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn spawn_sync_reader_thread<R: Read + Send + 'static>(
+    mut reader: R,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = reader.read_to_end(&mut buf);
+        tx.send(buf).ok();
+    });
+    rx
+}
+
+fn recv_sync_reader_output(rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    rx.recv_timeout(SYNC_READER_DRAIN_TIMEOUT)
+        .unwrap_or_default()
+}
+
 /// A background shell process being tracked
 pub struct BackgroundShell {
     pub id: String,
@@ -1035,27 +1054,20 @@ impl ShellManager {
         let stdout_handle = child.stdout.take().context("Failed to capture stdout")?;
         let stderr_handle = child.stderr.take().context("Failed to capture stderr")?;
 
-        // Spawn threads to read output
-        let stdout_thread = std::thread::spawn(move || {
-            let mut reader = stdout_handle;
-            let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
-        });
-
-        let stderr_thread = std::thread::spawn(move || {
-            let mut reader = stderr_handle;
-            let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
-        });
+        // Spawn threads to read output. Use bounded receives below so a killed
+        // or detached descendant that keeps pipe handles open cannot wedge the
+        // foreground shell path while the global tool lock is held (#2571).
+        let stdout_rx = spawn_sync_reader_thread(stdout_handle);
+        let stderr_rx = spawn_sync_reader_thread(stderr_handle);
 
         // Wait with timeout
         if let Some(status) = child.wait_timeout(timeout)? {
+            #[cfg(unix)]
+            let _ = kill_child_process_group(&mut child);
             #[cfg(windows)]
             terminate_and_close_windows_job(windows_job);
-            let stdout = stdout_thread.join().unwrap_or_default();
-            let stderr = stderr_thread.join().unwrap_or_default();
+            let stdout = recv_sync_reader_output(&stdout_rx);
+            let stderr = recv_sync_reader_output(&stderr_rx);
             let stdout_str = String::from_utf8_lossy(&stdout).to_string();
             let stderr_str = String::from_utf8_lossy(&stderr).to_string();
             let exit_code = status.code().unwrap_or(-1);
@@ -1099,8 +1111,8 @@ impl ShellManager {
             #[cfg(all(not(unix), not(windows)))]
             let _ = child.kill();
             let status = child.wait().ok();
-            let stdout = stdout_thread.join().unwrap_or_default();
-            let stderr = stderr_thread.join().unwrap_or_default();
+            let stdout = recv_sync_reader_output(&stdout_rx);
+            let stderr = recv_sync_reader_output(&stderr_rx);
             let stdout_str = String::from_utf8_lossy(&stdout).to_string();
             let stderr_str = String::from_utf8_lossy(&stderr).to_string();
             let (stdout, stdout_meta) = truncate_with_meta(&stdout_str);
