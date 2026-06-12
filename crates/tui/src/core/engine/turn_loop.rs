@@ -247,7 +247,7 @@ impl Engine {
                 stream_retry_attempts,
             ) {
                 let message = "No new user, tool, sub-agent, or continuation input since the last provider request; ending turn instead of dispatching a runtime-prompt-only request.";
-                crate::logging::warn(message.to_string());
+                crate::logging::warn(message);
                 let _ = self.tx_event.send(Event::status(message)).await;
                 break;
             }

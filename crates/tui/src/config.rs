@@ -2393,16 +2393,13 @@ impl Config {
     where
         F: Fn(&ProviderConfig) -> Option<String>,
     {
-        if let Some(value) = self
-            .provider_config_for(provider)
-            .and_then(|entry| get(entry))
-        {
+        if let Some(value) = self.provider_config_for(provider).and_then(&get) {
             return Some(value);
         }
         if provider == ApiProvider::SiliconflowCn {
             return self
                 .provider_config_for(ApiProvider::Siliconflow)
-                .and_then(|entry| get(entry));
+                .and_then(get);
         }
         None
     }
@@ -2447,10 +2444,10 @@ impl Config {
             // provider (e.g. `MiniMax-M2.7` on an OpenAI-compatible endpoint).
             // It must pass through verbatim rather than fall back to a
             // DeepSeek/provider default (issue #1714).
-            if !matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
-                if !model.is_empty() {
-                    return model.to_string();
-                }
+            if !matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
+                && !model.is_empty()
+            {
+                return model.to_string();
             }
         }
         // The Codex Responses backend only serves its own model family, and a
