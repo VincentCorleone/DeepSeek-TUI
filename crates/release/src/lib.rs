@@ -347,7 +347,136 @@ fn version_is_beta(version: &semver::Version) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
     use super::*;
+
+    static RELEASE_ENV_LOCK: Mutex<()> = Mutex::new(());
+    const RELEASE_ENV_VARS: &[&str] = &[
+        RELEASE_BASE_URL_ENV,
+        LEGACY_RELEASE_BASE_URL_ENV,
+        DEEPSEEK_RELEASE_BASE_URL_ENV,
+        CNB_MIRROR_ENV,
+    ];
+
+    struct ReleaseEnvGuard {
+        previous: Vec<(&'static str, Option<OsString>)>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl ReleaseEnvGuard {
+        fn clear() -> Self {
+            let lock = RELEASE_ENV_LOCK.lock().expect("release env lock poisoned");
+            let previous = RELEASE_ENV_VARS
+                .iter()
+                .map(|&name| (name, std::env::var_os(name)))
+                .collect();
+            for &name in RELEASE_ENV_VARS {
+                // SAFETY: tests that mutate these process-wide vars hold RELEASE_ENV_LOCK.
+                unsafe { std::env::remove_var(name) };
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ReleaseEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.previous {
+                // SAFETY: the guard still holds RELEASE_ENV_LOCK while restoring state.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_release_env(name: &str, value: &str) {
+        // SAFETY: callers hold a ReleaseEnvGuard, which serializes env mutation.
+        unsafe { std::env::set_var(name, value) };
+    }
+
+    #[test]
+    fn release_base_url_from_env_returns_none_without_overrides() {
+        let _env = ReleaseEnvGuard::clear();
+
+        assert_eq!(release_base_url_from_env("1.0.0"), None);
+    }
+
+    #[test]
+    fn release_base_url_from_env_prefers_primary_override() {
+        let _env = ReleaseEnvGuard::clear();
+        set_release_env(RELEASE_BASE_URL_ENV, "https://primary.example.com");
+        set_release_env(LEGACY_RELEASE_BASE_URL_ENV, "https://legacy.example.com");
+
+        assert_eq!(
+            release_base_url_from_env("1.0.0"),
+            Some("https://primary.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn release_base_url_from_env_falls_back_to_legacy_overrides() {
+        let _env = ReleaseEnvGuard::clear();
+        set_release_env(LEGACY_RELEASE_BASE_URL_ENV, "https://legacy.example.com");
+        set_release_env(
+            DEEPSEEK_RELEASE_BASE_URL_ENV,
+            "https://deepseek.example.com",
+        );
+
+        assert_eq!(
+            release_base_url_from_env("1.0.0"),
+            Some("https://legacy.example.com".to_string())
+        );
+
+        set_release_env(LEGACY_RELEASE_BASE_URL_ENV, "");
+
+        assert_eq!(
+            release_base_url_from_env("1.0.0"),
+            Some("https://deepseek.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn release_base_url_from_env_trims_and_ignores_empty_overrides() {
+        let _env = ReleaseEnvGuard::clear();
+        set_release_env(RELEASE_BASE_URL_ENV, "  https://spaced.example.com  \n");
+
+        assert_eq!(
+            release_base_url_from_env("1.0.0"),
+            Some("https://spaced.example.com".to_string())
+        );
+
+        set_release_env(RELEASE_BASE_URL_ENV, "   ");
+        set_release_env(LEGACY_RELEASE_BASE_URL_ENV, "");
+        set_release_env(DEEPSEEK_RELEASE_BASE_URL_ENV, "\n");
+
+        assert_eq!(release_base_url_from_env("1.0.0"), None);
+    }
+
+    #[test]
+    fn release_base_url_from_env_uses_cnb_mirror_last() {
+        let _env = ReleaseEnvGuard::clear();
+        set_release_env(CNB_MIRROR_ENV, "1");
+
+        assert_eq!(
+            release_base_url_from_env("v1.2.3"),
+            Some("https://cnb.cool/Hmbown/CodeWhale/-/releases/v1.2.3".to_string())
+        );
+
+        set_release_env(RELEASE_BASE_URL_ENV, "https://explicit.example.com");
+
+        assert_eq!(
+            release_base_url_from_env("1.0.0"),
+            Some("https://explicit.example.com".to_string())
+        );
+    }
 
     #[test]
     fn cnb_release_base_url_includes_tag_directory() {
