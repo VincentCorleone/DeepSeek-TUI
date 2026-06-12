@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Goal lifecycle controls.** `/goal` is now the primary command surface for
   session goals, with `pause`, `resume`, `complete`, `blocked`, and `clear`
   controls while `/hunt` remains a compatibility alias.
+- **Persistent thread-goal API.** App-server clients can now set, get, and clear
+  durable thread goals through `thread/goal/set`, `thread/goal/get`, and
+  `thread/goal/clear`, backed by the state store with Codex-style status and
+  token/time accounting fields.
 - **Command-boundary ownership layers (#2888/#3055).** Built-in slash command
   metadata now lives in `commands/registry.rs`, slash parsing in
   `commands/parse.rs`, and handlers under group-owned command areas, preserving

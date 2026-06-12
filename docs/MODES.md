@@ -56,6 +56,12 @@ the turn, `/goal complete` marks it done, `/goal blocked` marks it blocked, and
 approval mode, or model route. This remains distinct from `--model auto`, which
 only controls model and thinking selection.
 
+App-server clients can persist a thread-scoped goal with `thread/goal/set`, read
+it with `thread/goal/get`, and clear it with `thread/goal/clear`. That persisted
+record carries `active`, `paused`, `blocked`, `usage_limited`, `budget_limited`,
+or `complete` status plus token/time accounting fields for clients that need
+thread resume semantics.
+
 ## Compatibility Notes
 
 - Older settings files with `default_mode = "normal"` still load as `agent`; saving rewrites the normalized value.

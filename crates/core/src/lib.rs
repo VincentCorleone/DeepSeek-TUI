@@ -15,12 +15,14 @@ use codewhale_mcp::{
 };
 use codewhale_protocol::{
     AppResponse, EventFrame, ExecApprovalRequestEvent, PromptRequest, PromptResponse,
-    ResponseChannel, ReviewDecision, Thread, ThreadForkParams, ThreadListParams, ThreadReadParams,
+    ResponseChannel, ReviewDecision, Thread, ThreadForkParams, ThreadGoal, ThreadGoalClearParams,
+    ThreadGoalGetParams, ThreadGoalSetParams, ThreadGoalStatus, ThreadListParams, ThreadReadParams,
     ThreadRequest, ThreadResponse, ThreadResumeParams, ThreadSetNameParams, ThreadStatus,
     ToolPayload,
 };
 use codewhale_state::{
-    JobStateRecord, JobStateStatus, SessionSource, StateStore, ThreadListFilters, ThreadMetadata,
+    JobStateRecord, JobStateStatus, SessionSource, StateStore, ThreadGoalRecord,
+    ThreadGoalStatus as PersistedThreadGoalStatus, ThreadListFilters, ThreadMetadata,
     ThreadStatus as PersistedThreadStatus,
 };
 use codewhale_tools::{ToolCall, ToolRegistry};
@@ -644,6 +646,40 @@ impl ThreadManager {
         Ok(Some(updated))
     }
 
+    /// Sets or replaces the persisted goal for a thread.
+    pub fn set_thread_goal(&mut self, params: &ThreadGoalSetParams) -> Result<Option<ThreadGoal>> {
+        if self.store.get_thread(&params.thread_id)?.is_none() {
+            return Ok(None);
+        }
+        let now = chrono::Utc::now().timestamp();
+        let goal = ThreadGoalRecord {
+            thread_id: params.thread_id.clone(),
+            goal_id: format!("goal-{}", Uuid::new_v4()),
+            objective: params.objective.clone(),
+            status: PersistedThreadGoalStatus::Active,
+            token_budget: params.token_budget,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        self.store.upsert_thread_goal(&goal)?;
+        Ok(Some(to_protocol_goal(goal)))
+    }
+
+    /// Reads the persisted goal for a thread.
+    pub fn get_thread_goal(&self, params: &ThreadGoalGetParams) -> Result<Option<ThreadGoal>> {
+        Ok(self
+            .store
+            .get_thread_goal(&params.thread_id)?
+            .map(to_protocol_goal))
+    }
+
+    /// Clears the persisted goal for a thread, returning whether one existed.
+    pub fn clear_thread_goal(&mut self, params: &ThreadGoalClearParams) -> Result<bool> {
+        self.store.delete_thread_goal(&params.thread_id)
+    }
+
     /// Archives a thread so it no longer appears in default listings.
     pub fn archive_thread(&mut self, thread_id: &str) -> Result<()> {
         self.store.mark_archived(thread_id)?;
@@ -792,9 +828,16 @@ impl Runtime {
                 })
             });
 
+        let goal = self
+            .thread_manager
+            .state_store()
+            .get_thread_goal(thread_id)?
+            .map(to_protocol_goal);
+
         Ok(json!({
             "history": history,
-            "checkpoint": checkpoint
+            "checkpoint": checkpoint,
+            "goal": goal
         }))
     }
 
@@ -858,6 +901,7 @@ impl Runtime {
                         status: "missing".to_string(),
                         thread: None,
                         threads: Vec::new(),
+                        goal: None,
                         model: None,
                         model_provider: None,
                         cwd: None,
@@ -880,6 +924,7 @@ impl Runtime {
                         status: "missing".to_string(),
                         thread: None,
                         threads: Vec::new(),
+                        goal: None,
                         model: None,
                         model_provider: None,
                         cwd: None,
@@ -895,6 +940,7 @@ impl Runtime {
                 status: "ok".to_string(),
                 thread: None,
                 threads: self.thread_manager.list_threads(&params)?,
+                goal: None,
                 model: None,
                 model_provider: None,
                 cwd: None,
@@ -911,6 +957,9 @@ impl Runtime {
                     status: "ok".to_string(),
                     thread: self.thread_manager.read_thread(&params)?,
                     threads: Vec::new(),
+                    goal: self.thread_manager.get_thread_goal(&ThreadGoalGetParams {
+                        thread_id: params.thread_id,
+                    })?,
                     model: None,
                     model_provider: None,
                     cwd: None,
@@ -925,6 +974,7 @@ impl Runtime {
                 status: "ok".to_string(),
                 thread: self.thread_manager.set_thread_name(&params)?,
                 threads: Vec::new(),
+                goal: None,
                 model: None,
                 model_provider: None,
                 cwd: None,
@@ -933,6 +983,79 @@ impl Runtime {
                 events: Vec::new(),
                 data: json!({}),
             }),
+            ThreadRequest::GoalSet(params) => {
+                let thread_id = params.thread_id.clone();
+                if let Some(goal) = self.thread_manager.set_thread_goal(&params)? {
+                    Ok(ThreadResponse {
+                        thread_id,
+                        status: "ok".to_string(),
+                        thread: None,
+                        threads: Vec::new(),
+                        goal: Some(goal.clone()),
+                        model: None,
+                        model_provider: None,
+                        cwd: None,
+                        approval_policy: None,
+                        sandbox: None,
+                        events: vec![EventFrame::ThreadGoalUpdated { goal: goal.clone() }],
+                        data: json!({ "goal": goal }),
+                    })
+                } else {
+                    Ok(ThreadResponse {
+                        thread_id,
+                        status: "missing".to_string(),
+                        thread: None,
+                        threads: Vec::new(),
+                        goal: None,
+                        model: None,
+                        model_provider: None,
+                        cwd: None,
+                        approval_policy: None,
+                        sandbox: None,
+                        events: Vec::new(),
+                        data: json!({"error":"thread not found"}),
+                    })
+                }
+            }
+            ThreadRequest::GoalGet(params) => {
+                let goal = self.thread_manager.get_thread_goal(&params)?;
+                Ok(ThreadResponse {
+                    thread_id: params.thread_id,
+                    status: "ok".to_string(),
+                    thread: None,
+                    threads: Vec::new(),
+                    goal: goal.clone(),
+                    model: None,
+                    model_provider: None,
+                    cwd: None,
+                    approval_policy: None,
+                    sandbox: None,
+                    events: Vec::new(),
+                    data: json!({ "goal": goal }),
+                })
+            }
+            ThreadRequest::GoalClear(params) => {
+                let thread_id = params.thread_id.clone();
+                let cleared = self.thread_manager.clear_thread_goal(&params)?;
+                Ok(ThreadResponse {
+                    thread_id: thread_id.clone(),
+                    status: if cleared { "cleared" } else { "empty" }.to_string(),
+                    thread: None,
+                    threads: Vec::new(),
+                    goal: None,
+                    model: None,
+                    model_provider: None,
+                    cwd: None,
+                    approval_policy: None,
+                    sandbox: None,
+                    events: if cleared {
+                        vec![EventFrame::ThreadGoalCleared { thread_id }]
+                    } else {
+                        Vec::new()
+                    },
+                    data: json!({ "cleared": cleared }),
+                })
+            }
             ThreadRequest::Archive { thread_id } => {
                 self.thread_manager.archive_thread(&thread_id)?;
                 Ok(ThreadResponse {
@@ -940,6 +1063,7 @@ impl Runtime {
                     status: "archived".to_string(),
                     thread: None,
                     threads: Vec::new(),
+                    goal: None,
                     model: None,
                     model_provider: None,
                     cwd: None,
@@ -956,6 +1080,7 @@ impl Runtime {
                     status: "unarchived".to_string(),
                     thread: None,
                     threads: Vec::new(),
+                    goal: None,
                     model: None,
                     model_provider: None,
                     cwd: None,
@@ -984,6 +1109,7 @@ impl Runtime {
                     status: "accepted".to_string(),
                     thread: None,
                     threads: Vec::new(),
+                    goal: None,
                     model: None,
                     model_provider: None,
                     cwd: None,
@@ -1476,6 +1602,7 @@ fn thread_response_from_new(status: &str, new: NewThread) -> ThreadResponse {
         status: status.to_string(),
         thread: Some(new.thread),
         threads: Vec::new(),
+        goal: None,
         model: Some(new.model),
         model_provider: Some(new.model_provider),
         cwd: Some(new.cwd),
@@ -1553,6 +1680,31 @@ fn to_protocol_thread(thread: ThreadMetadata) -> Thread {
             SessionSource::Unknown => codewhale_protocol::SessionSource::Unknown,
         },
         name: thread.name,
+    }
+}
+
+fn to_protocol_goal(goal: ThreadGoalRecord) -> ThreadGoal {
+    ThreadGoal {
+        thread_id: goal.thread_id,
+        goal_id: goal.goal_id,
+        objective: goal.objective,
+        status: to_protocol_goal_status(goal.status),
+        token_budget: goal.token_budget,
+        tokens_used: goal.tokens_used,
+        time_used_seconds: goal.time_used_seconds,
+        created_at: goal.created_at,
+        updated_at: goal.updated_at,
+    }
+}
+
+fn to_protocol_goal_status(status: PersistedThreadGoalStatus) -> ThreadGoalStatus {
+    match status {
+        PersistedThreadGoalStatus::Active => ThreadGoalStatus::Active,
+        PersistedThreadGoalStatus::Paused => ThreadGoalStatus::Paused,
+        PersistedThreadGoalStatus::Blocked => ThreadGoalStatus::Blocked,
+        PersistedThreadGoalStatus::UsageLimited => ThreadGoalStatus::UsageLimited,
+        PersistedThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
+        PersistedThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
     }
 }
 
