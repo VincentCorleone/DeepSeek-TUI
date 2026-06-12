@@ -559,4 +559,25 @@ mod tests {
             "Failed to validate input: missing required field 'path'"
         );
     }
+
+    #[test]
+    fn tool_error_invalid_input_creates_correct_variant() {
+        let err = ToolError::invalid_input("test invalid message");
+        match err {
+            ToolError::InvalidInput { message } => {
+                assert_eq!(message, "test invalid message");
+            }
+            _ => panic!("Expected ToolError::InvalidInput, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_error_path_escape_display() {
+        let path = std::path::PathBuf::from("../outside");
+        let err = ToolError::path_escape(path);
+        assert_eq!(
+            err.to_string(),
+            "Failed to resolve path '../outside': path escapes workspace"
+        );
+    }
 }
