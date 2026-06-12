@@ -6,7 +6,7 @@ use crate::config::{
 use crate::config_ui::{self, WebConfigSession, WebConfigSessionEvent};
 use crate::core::engine::mock_engine_handle;
 use crate::tui::active_cell::ActiveCell;
-use crate::tui::app::ToolDetailRecord;
+use crate::tui::app::{SidebarHoverRow, SidebarHoverSection, ToolDetailRecord};
 use crate::tui::file_mention::{
     apply_mention_menu_selection, find_file_mention_completions, partial_file_mention_at_cursor,
     try_autocomplete_file_mention, user_request_with_file_mentions, visible_mention_menu_entries,
@@ -698,6 +698,60 @@ fn loading_mouse_filter_keeps_active_drags() {
     app.viewport.transcript_selection.dragging = false;
     app.viewport.transcript_scrollbar_dragging = true;
     assert!(!should_drop_loading_mouse_motion(&app, drag));
+}
+
+#[test]
+fn loading_mouse_filter_allows_sidebar_hover_popovers() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.viewport.last_sidebar_area = Some(Rect::new(60, 4, 20, 6));
+    app.sidebar_hover.sections.push(SidebarHoverSection {
+        content_area: Rect::new(60, 4, 20, 6),
+        lines: vec!["Visible row".to_string()],
+        rows: vec![SidebarHoverRow {
+            row_y: 5,
+            display_text: "Truncated".to_string(),
+            full_text: "Full sidebar task label".to_string(),
+            detail: Some("Detailed context".to_string()),
+            is_truncated: true,
+            click_action: None,
+        }],
+    });
+    let moved = MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: 65,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert!(!should_drop_loading_mouse_motion(&app, moved));
+    handle_mouse_event(&mut app, moved);
+
+    assert_eq!(
+        app.sidebar_hover_tooltip.as_deref(),
+        Some("Full sidebar task label\nDetailed context")
+    );
+    assert_eq!(app.last_mouse_pos, Some((65, 5)));
+}
+
+#[test]
+fn loading_mouse_filter_allows_sidebar_hover_to_clear() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.viewport.last_sidebar_area = Some(Rect::new(60, 4, 20, 6));
+    app.sidebar_hover_tooltip = Some("Stale sidebar tooltip".to_string());
+    let moved = MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: 12,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert!(!should_drop_loading_mouse_motion(&app, moved));
+    handle_mouse_event(&mut app, moved);
+
+    assert_eq!(app.sidebar_hover_tooltip, None);
+    assert_eq!(app.last_mouse_pos, Some((12, 5)));
 }
 
 #[test]

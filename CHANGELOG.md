@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Sidebar context menus (#3065).** Right-clicking the sidebar no longer shows
   `Paste`; clickable sidebar rows now offer their row command as the first
   context action.
+- **Sidebar hover popovers (#3088).** Streaming turns now keep sidebar hover
+  popovers responsive while continuing to throttle transcript/body mouse
+  motion.
 - **Cursor-style activity metadata rows (#3146).** Dense successful tool-run
   summaries now render as a single muted `Explored ...` / `Updated metadata`
   row, include short command-family labels for successful generic verifier

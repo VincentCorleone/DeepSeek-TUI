@@ -33,7 +33,10 @@ pub(crate) fn should_drop_loading_mouse_motion(app: &App, mouse: MouseEvent) -> 
     }
 
     match mouse.kind {
-        MouseEventKind::Moved => true,
+        MouseEventKind::Moved => {
+            let over_sidebar = mouse_hits_rect(mouse, app.viewport.last_sidebar_area);
+            !(over_sidebar || app.sidebar_hover_tooltip.is_some())
+        }
         MouseEventKind::Drag(_) => {
             !app.viewport.transcript_selection.dragging
                 && !app.viewport.transcript_scrollbar_dragging
