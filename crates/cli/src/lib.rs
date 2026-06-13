@@ -200,6 +200,8 @@ and writes a SWE-bench-compatible JSONL prediction row from the resulting
 working-tree diff. `export` only writes the current diff.
 ")]
     Swebench(TuiPassthroughArgs),
+    /// Manage durable Agent Fleet runs via the TUI runtime.
+    Fleet(TuiPassthroughArgs),
     /// Run a CodeWhale-powered code review over a git diff.
     Review(TuiPassthroughArgs),
     /// Apply a patch file or stdin to the working tree.
@@ -580,6 +582,10 @@ fn run() -> Result<()> {
         Some(Commands::Swebench(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("swebench", args))
+        }
+        Some(Commands::Fleet(args)) => {
+            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            delegate_to_tui(&cli, &resolved_runtime, tui_args("fleet", args))
         }
         Some(Commands::Review(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
@@ -2413,6 +2419,28 @@ mod tests {
             cli.command,
             Some(Commands::Setup(TuiPassthroughArgs { ref args }))
                 if args == &["--skills", "--local"]
+        ));
+
+        let cli = parse_ok(&["codewhale", "fleet", "init"]);
+        assert!(cli.prompt.is_empty());
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Fleet(TuiPassthroughArgs { ref args })) if args == &["init"]
+        ));
+
+        let cli = parse_ok(&[
+            "codewhale",
+            "fleet",
+            "run",
+            "tasks.json",
+            "--max-workers",
+            "2",
+        ]);
+        assert!(cli.prompt.is_empty());
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Fleet(TuiPassthroughArgs { ref args }))
+                if args == &["run", "tasks.json", "--max-workers", "2"]
         ));
     }
 

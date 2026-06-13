@@ -2639,6 +2639,7 @@ impl Config {
             return model.trim().to_string();
         }
         if let Some(model) = self.default_text_model.as_deref()
+            && !root_deepseek_model_is_foreign_to_direct_provider(provider, model)
             && let Some(normalized) = normalize_model_name_for_provider(provider, model)
         {
             return normalized;
@@ -3356,6 +3357,31 @@ impl Config {
             exponential_base: cfg.exponential_base.unwrap_or(defaults.exponential_base),
         }
     }
+}
+
+fn root_deepseek_model_is_foreign_to_direct_provider(provider: ApiProvider, model: &str) -> bool {
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
+        || provider_passes_model_through(provider)
+    {
+        return false;
+    }
+    if matches!(
+        provider,
+        ApiProvider::NvidiaNim
+            | ApiProvider::Openrouter
+            | ApiProvider::Novita
+            | ApiProvider::Fireworks
+            | ApiProvider::Siliconflow
+            | ApiProvider::SiliconflowCn
+            | ApiProvider::Sglang
+            | ApiProvider::Vllm
+            | ApiProvider::Volcengine
+            | ApiProvider::Atlascloud
+            | ApiProvider::WanjieArk
+    ) {
+        return false;
+    }
+    normalize_model_name(model).is_some()
 }
 
 // === Defaults ===
@@ -9134,6 +9160,18 @@ http_headers = { "X-Model-Provider-Id" = "from-file" }
             ..Default::default()
         };
         assert_eq!(pinned.default_model(), "gpt-5.5-codex-preview");
+    }
+
+    #[test]
+    fn direct_provider_ignores_foreign_deepseek_root_default_model() {
+        let config = Config {
+            provider: Some("zai".to_string()),
+            default_text_model: Some(DEFAULT_TEXT_MODEL.to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(config.api_provider(), ApiProvider::Zai);
+        assert_eq!(config.default_model(), DEFAULT_ZAI_MODEL);
     }
 
     #[test]

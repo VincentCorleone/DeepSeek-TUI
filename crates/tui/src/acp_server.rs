@@ -181,11 +181,13 @@ impl AcpServer {
 
     async fn run_prompt(&self, prompt: &str, cwd: &PathBuf) -> Result<String> {
         let _cwd_guard = ScopedCurrentDir::new(cwd)?;
-        let client = DeepSeekClient::new(&self.config)?;
-        let route = crate::resolve_cli_auto_route(&self.config, &self.model, prompt).await;
+        let route = crate::resolve_cli_auto_route(&self.config, &self.model, prompt).await?;
+        let execution_config = crate::config_for_cli_route(&self.config, &route);
+        let client = DeepSeekClient::new(&execution_config)?;
         let reasoning_effort = route
             .reasoning_effort
-            .map(|effort| effort.as_setting().to_string());
+            .and_then(|effort| effort.api_value_for_provider(execution_config.api_provider()))
+            .map(str::to_string);
 
         let request = MessageRequest {
             model: route.model,

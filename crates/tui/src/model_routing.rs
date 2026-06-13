@@ -5,11 +5,12 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::client::DeepSeekClient;
 use crate::config::{ApiProvider, Config};
 use crate::llm_client::LlmClient;
+use crate::model_inventory::ModelInventory;
 use crate::models::{ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt};
 use crate::tui::app::ReasoningEffort;
 
@@ -223,6 +224,7 @@ impl AutoRouteSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AutoRouteSelection {
+    pub(crate) provider: ApiProvider,
     pub(crate) model: String,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) source: AutoRouteSource,
@@ -378,6 +380,7 @@ pub(crate) async fn resolve_auto_route_with_flash(
     .await
     {
         Ok(Some(recommendation)) => AutoRouteSelection {
+            provider: config.api_provider(),
             model: recommendation.model,
             reasoning_effort: recommendation.reasoning_effort,
             source: AutoRouteSource::FlashRouter,
@@ -394,6 +397,7 @@ fn auto_route_from_heuristic(
     heuristic: AutoModelHeuristicSelection,
 ) -> AutoRouteSelection {
     AutoRouteSelection {
+        provider,
         model: heuristic.model,
         reasoning_effort: Some(normalize_auto_route_effort_for_provider(
             provider,
@@ -401,6 +405,162 @@ fn auto_route_from_heuristic(
         )),
         source: AutoRouteSource::Heuristic,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InventoryAutoRouteRecommendation {
+    provider: ApiProvider,
+    model: String,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+pub(crate) async fn resolve_auto_route_with_inventory(
+    config: &Config,
+    latest_request: &str,
+    recent_context: &str,
+    selected_model_mode: &str,
+    selected_thinking_mode: &str,
+) -> Result<AutoRouteSelection> {
+    let inventory = ModelInventory::from_config(config);
+    if !inventory.router_available {
+        bail!(
+            "model auto requires a DeepSeek API key so codewhale can use deepseek-v4-flash as the non-thinking router. Run `codewhale auth set --provider deepseek` or choose an explicit model."
+        );
+    }
+
+    let heuristic = auto_route_from_inventory_heuristic(config, latest_request, &inventory);
+    if cfg!(test) {
+        return Ok(heuristic);
+    }
+
+    match auto_route_inventory_recommendation(
+        config,
+        &inventory,
+        latest_request,
+        recent_context,
+        selected_model_mode,
+        selected_thinking_mode,
+    )
+    .await
+    {
+        Ok(Some(recommendation)) => Ok(AutoRouteSelection {
+            provider: recommendation.provider,
+            model: recommendation.model,
+            reasoning_effort: recommendation.reasoning_effort,
+            source: AutoRouteSource::FlashRouter,
+        }),
+        Ok(None) | Err(_) => Ok(heuristic),
+    }
+}
+
+fn auto_route_from_inventory_heuristic(
+    config: &Config,
+    latest_request: &str,
+    inventory: &ModelInventory,
+) -> AutoRouteSelection {
+    let fallback = inventory
+        .active_default()
+        .or_else(|| inventory.candidates.first());
+    let Some(candidate) = fallback else {
+        return AutoRouteSelection {
+            provider: config.api_provider(),
+            model: config.default_model(),
+            reasoning_effort: Some(crate::auto_reasoning::select(false, latest_request)),
+            source: AutoRouteSource::Heuristic,
+        };
+    };
+    AutoRouteSelection {
+        provider: candidate.provider,
+        model: candidate.model.clone(),
+        reasoning_effort: Some(crate::auto_reasoning::select(false, latest_request)),
+        source: AutoRouteSource::Heuristic,
+    }
+}
+
+async fn auto_route_inventory_recommendation(
+    config: &Config,
+    inventory: &ModelInventory,
+    latest_request: &str,
+    recent_context: &str,
+    selected_model_mode: &str,
+    selected_thinking_mode: &str,
+) -> Result<Option<InventoryAutoRouteRecommendation>> {
+    let mut router_config = config.clone();
+    router_config.provider = Some(ApiProvider::Deepseek.as_str().to_string());
+    router_config.default_text_model = Some(inventory.router_model.to_string());
+
+    let client = DeepSeekClient::new(&router_config)?;
+    let router_system = inventory_auto_router_system_prompt(inventory);
+    let request = MessageRequest {
+        model: inventory.router_model.to_string(),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: auto_route_prompt(
+                    latest_request,
+                    recent_context,
+                    selected_model_mode,
+                    selected_thinking_mode,
+                ),
+                cache_control: None,
+            }],
+        }],
+        max_tokens: 128,
+        system: Some(SystemPrompt::Text(router_system)),
+        tools: None,
+        tool_choice: None,
+        metadata: None,
+        thinking: None,
+        reasoning_effort: Some("off".to_string()),
+        stream: Some(false),
+        temperature: Some(0.0),
+        top_p: None,
+    };
+
+    let response =
+        tokio::time::timeout(Duration::from_secs(4), client.create_message(request)).await??;
+    Ok(parse_inventory_auto_route_recommendation(
+        &message_response_text(&response),
+        inventory,
+    ))
+}
+
+fn inventory_auto_router_system_prompt(inventory: &ModelInventory) -> String {
+    format!(
+        "You are the codewhale model-routing classifier. Return only compact JSON: \
+{{\"provider\":\"<provider>\",\"model\":\"<model>\",\"thinking\":\"off|high|max\"}}.\n\
+Choose only provider/model pairs present in the inventory JSON. Use off only for trivial no-tool answers, \
+high for ordinary reasoning, and max for agentic, coding, multi-file, release, architecture, debugging, \
+security, tool-heavy, or uncertain work.\n\nInventory JSON:\n{}",
+        inventory.router_context_json()
+    )
+}
+
+fn parse_inventory_auto_route_recommendation(
+    raw: &str,
+    inventory: &ModelInventory,
+) -> Option<InventoryAutoRouteRecommendation> {
+    let json = extract_first_json_object(raw)?;
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let provider = value
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .and_then(ApiProvider::parse)?;
+    let model = value.get("model").and_then(serde_json::Value::as_str)?;
+    let candidate = inventory.candidate(provider, model)?;
+    let reasoning_effort = value
+        .get("thinking")
+        .or_else(|| value.get("reasoning_effort"))
+        .or_else(|| value.get("effort"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_auto_route_reasoning_effort)
+        .map(|effort| normalize_auto_route_effort_for_provider(provider, effort));
+
+    Some(InventoryAutoRouteRecommendation {
+        provider,
+        model: candidate.model.clone(),
+        reasoning_effort,
+    })
 }
 
 async fn auto_route_flash_recommendation(
@@ -692,6 +852,37 @@ mod tests {
         assert!(
             parse_auto_route_recommendation(r#"{"model":"some-other-model","thinking":"max"}"#,)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn inventory_auto_route_recommendation_requires_runnable_pair() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _deepseek = crate::test_support::EnvVarGuard::set("DEEPSEEK_API_KEY", "ds-key");
+        let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-key");
+        let config = Config {
+            provider: Some("zai".to_string()),
+            default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
+            ..Default::default()
+        };
+        let inventory = ModelInventory::from_config(&config);
+
+        let route = parse_inventory_auto_route_recommendation(
+            r#"{"provider":"zai","model":"GLM-5.2","thinking":"max"}"#,
+            &inventory,
+        )
+        .expect("valid inventory route should parse");
+        assert_eq!(route.provider, ApiProvider::Zai);
+        assert_eq!(route.model, crate::config::ZAI_GLM_5_2_MODEL);
+        assert_eq!(route.reasoning_effort, Some(ReasoningEffort::Max));
+
+        assert!(
+            parse_inventory_auto_route_recommendation(
+                r#"{"provider":"zai","model":"deepseek-v4-pro","thinking":"max"}"#,
+                &inventory,
+            )
+            .is_none(),
+            "router must not pair a DeepSeek model with the Z.ai provider"
         );
     }
 

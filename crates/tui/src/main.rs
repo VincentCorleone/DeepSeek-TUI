@@ -49,6 +49,7 @@ mod lsp;
 mod mcp;
 mod mcp_server;
 mod memory;
+mod model_inventory;
 mod model_routing;
 mod models;
 mod network_policy;
@@ -4762,11 +4763,12 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
         .model
         .or_else(|| config.default_text_model.clone())
         .unwrap_or_else(|| config.default_model());
-    let route = resolve_cli_auto_route(config, &model, &diff).await;
-    let model = route.model;
+    let route = resolve_cli_auto_route(config, &model, &diff).await?;
+    let execution_config = config_for_cli_route(config, &route);
+    let model = route.model.clone();
     let reasoning_effort = route
         .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(config, effort));
+        .and_then(|effort| cli_reasoning_effort_value(&execution_config, effort));
 
     let system = SystemPrompt::Text(
         "You are a senior code reviewer. Focus on bugs, risks, behavioral regressions, and missing tests. \
@@ -4776,7 +4778,7 @@ Provide findings ordered by severity with file references, then open questions, 
     let user_prompt =
         format!("Review the following diff and provide feedback:\n\n{diff}\n\nEnd of diff.");
 
-    let client = DeepSeekClient::new(config)?;
+    let client = DeepSeekClient::new(&execution_config)?;
     let request = MessageRequest {
         model: model.clone(),
         messages: vec![Message {
@@ -6096,6 +6098,7 @@ async fn run_interactive(
 }
 
 struct CliAutoRoute {
+    provider: crate::config::ApiProvider,
     model: String,
     reasoning_effort: Option<crate::tui::app::ReasoningEffort>,
     auto_model: bool,
@@ -6110,15 +6113,36 @@ fn cli_reasoning_effort_value(
         .map(str::to_string)
 }
 
-async fn resolve_cli_auto_route(config: &Config, model: &str, prompt: &str) -> CliAutoRoute {
+fn config_for_cli_route(config: &Config, route: &CliAutoRoute) -> Config {
+    let mut execution_config = config.clone();
+    execution_config.provider = Some(route.provider.as_str().to_string());
+    execution_config
+        .provider_config_for_mut(route.provider)
+        .model = Some(route.model.clone());
+    if matches!(
+        route.provider,
+        crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN
+    ) {
+        execution_config.default_text_model = Some(route.model.clone());
+    }
+    execution_config
+}
+
+async fn resolve_cli_auto_route(
+    config: &Config,
+    model: &str,
+    prompt: &str,
+) -> Result<CliAutoRoute> {
     if model.trim().eq_ignore_ascii_case("auto") {
         let selection =
-            model_routing::resolve_auto_route_with_flash(config, prompt, "", "auto", "auto").await;
-        CliAutoRoute {
+            model_routing::resolve_auto_route_with_inventory(config, prompt, "", "auto", "auto")
+                .await?;
+        Ok(CliAutoRoute {
+            provider: selection.provider,
             model: selection.model,
             reasoning_effort: selection.reasoning_effort,
             auto_model: true,
-        }
+        })
     } else {
         // When --model is not `auto`, fall back to the reasoning_effort
         // declared in the user's config.toml. The previous hard-coded `None`
@@ -6126,13 +6150,14 @@ async fn resolve_cli_auto_route(config: &Config, model: &str, prompt: &str) -> C
         // call, which (for example) prevented vllm + Qwen3 users from
         // disabling thinking via `reasoning_effort = "off"` and caused
         // 30+ second SSE idle timeouts on trivial prompts.
-        CliAutoRoute {
+        Ok(CliAutoRoute {
+            provider: config.api_provider(),
             model: model.to_string(),
             reasoning_effort: config
                 .reasoning_effort()
                 .map(crate::tui::app::ReasoningEffort::from_setting),
             auto_model: false,
-        }
+        })
     }
 }
 
@@ -6140,11 +6165,12 @@ async fn run_one_shot(config: &Config, model: &str, prompt: &str) -> Result<()> 
     use crate::client::DeepSeekClient;
     use crate::models::{ContentBlock, Message, MessageRequest};
 
-    let client = DeepSeekClient::new(config)?;
-    let route = resolve_cli_auto_route(config, model, prompt).await;
+    let route = resolve_cli_auto_route(config, model, prompt).await?;
+    let execution_config = config_for_cli_route(config, &route);
+    let client = DeepSeekClient::new(&execution_config)?;
     let reasoning_effort = route
         .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(config, effort));
+        .and_then(|effort| cli_reasoning_effort_value(&execution_config, effort));
 
     let request = MessageRequest {
         model: route.model,
@@ -6182,12 +6208,13 @@ async fn run_one_shot_json(config: &Config, model: &str, prompt: &str) -> Result
     use crate::client::DeepSeekClient;
     use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt};
 
-    let client = DeepSeekClient::new(config)?;
-    let route = resolve_cli_auto_route(config, model, prompt).await;
-    let model = route.model;
+    let route = resolve_cli_auto_route(config, model, prompt).await?;
+    let execution_config = config_for_cli_route(config, &route);
+    let client = DeepSeekClient::new(&execution_config)?;
+    let model = route.model.clone();
     let reasoning_effort = route
         .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(config, effort));
+        .and_then(|effort| cli_reasoning_effort_value(&execution_config, effort));
     let request = MessageRequest {
         model: model.clone(),
         messages: vec![Message {
@@ -6358,12 +6385,13 @@ async fn run_exec_agent(
     use crate::tools::todo::new_shared_todo_list;
     use crate::tui::app::AppMode;
 
-    let route = resolve_cli_auto_route(config, model, prompt).await;
+    let route = resolve_cli_auto_route(config, model, prompt).await?;
+    let execution_config = config_for_cli_route(config, &route);
     let auto_model = route.auto_model;
     let effective_model = route.model;
     let effective_reasoning_effort = route
         .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(config, effort));
+        .and_then(|effort| cli_reasoning_effort_value(&execution_config, effort));
 
     let settings = crate::settings::Settings::load().unwrap_or_default();
     let auto_compact_enabled = if crate::settings::Settings::auto_compact_explicitly_configured() {
@@ -6381,24 +6409,24 @@ async fn run_exec_agent(
         ..Default::default()
     };
 
-    let network_policy = config.network.clone().map(|toml_cfg| {
+    let network_policy = execution_config.network.clone().map(|toml_cfg| {
         crate::network_policy::NetworkPolicyDecider::with_default_audit(toml_cfg.into_runtime())
     });
 
-    let lsp_config = config
+    let lsp_config = execution_config
         .lsp
         .clone()
         .map(crate::config::LspConfigToml::into_runtime);
     let engine_config = EngineConfig {
         model: effective_model.clone(),
         workspace: workspace.clone(),
-        allow_shell: auto_approve || config.allow_shell(),
+        allow_shell: auto_approve || execution_config.allow_shell(),
         trust_mode,
-        notes_path: config.notes_path(),
-        mcp_config_path: config.mcp_config_path(),
-        skills_dir: config.skills_dir(),
+        notes_path: execution_config.notes_path(),
+        mcp_config_path: execution_config.mcp_config_path(),
+        skills_dir: execution_config.skills_dir(),
         instructions: {
-            let mut instrs: Vec<crate::prompts::InstructionSource> = config
+            let mut instrs: Vec<crate::prompts::InstructionSource> = execution_config
                 .instructions_paths()
                 .into_iter()
                 .map(Into::into)
@@ -6411,39 +6439,45 @@ async fn run_exec_agent(
             }
             instrs
         },
-        project_context_pack_enabled: config.project_context_pack_enabled(),
+        project_context_pack_enabled: execution_config.project_context_pack_enabled(),
         translation_enabled: false,
         show_thinking: settings.show_thinking,
         max_steps: max_turns,
         max_subagents,
-        interactive_launch_limit: config.interactive_launch_limit(),
-        features: config.features(),
+        interactive_launch_limit: execution_config.interactive_launch_limit(),
+        features: execution_config.features(),
         compaction,
-        capacity: crate::core::capacity::CapacityControllerConfig::from_app_config(config),
+        capacity: crate::core::capacity::CapacityControllerConfig::from_app_config(
+            &execution_config,
+        ),
         todos: new_shared_todo_list(),
         plan_state: new_shared_plan_state(),
         goal_state: crate::tools::goal::new_shared_goal_state(),
         max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
         network_policy,
-        snapshots_enabled: config.snapshots_config().enabled,
-        snapshots_max_workspace_bytes: config
+        snapshots_enabled: execution_config.snapshots_config().enabled,
+        snapshots_max_workspace_bytes: execution_config
             .snapshots_config()
             .max_workspace_gb
             .saturating_mul(1024 * 1024 * 1024),
         lsp_config,
         runtime_services: crate::tools::spec::RuntimeToolServices::default(),
-        subagent_model_overrides: config.subagent_model_overrides(),
-        subagent_api_timeout: std::time::Duration::from_secs(config.subagent_api_timeout_secs()),
-        stream_chunk_timeout: std::time::Duration::from_secs(config.stream_chunk_timeout_secs()),
-        subagent_heartbeat_timeout: std::time::Duration::from_secs(
-            config.subagent_heartbeat_timeout_secs(),
+        subagent_model_overrides: execution_config.subagent_model_overrides(),
+        subagent_api_timeout: std::time::Duration::from_secs(
+            execution_config.subagent_api_timeout_secs(),
         ),
-        prefer_bwrap: config.prefer_bwrap.unwrap_or(false),
-        memory_enabled: config.memory_enabled(),
-        memory_path: config.memory_path(),
-        speech_output_dir: config.speech_output_dir(),
-        vision_config: config.vision_model_config(),
-        strict_tool_mode: config.strict_tool_mode.unwrap_or(false),
+        stream_chunk_timeout: std::time::Duration::from_secs(
+            execution_config.stream_chunk_timeout_secs(),
+        ),
+        subagent_heartbeat_timeout: std::time::Duration::from_secs(
+            execution_config.subagent_heartbeat_timeout_secs(),
+        ),
+        prefer_bwrap: execution_config.prefer_bwrap.unwrap_or(false),
+        memory_enabled: execution_config.memory_enabled(),
+        memory_path: execution_config.memory_path(),
+        speech_output_dir: execution_config.speech_output_dir(),
+        vision_config: execution_config.vision_model_config(),
+        strict_tool_mode: execution_config.strict_tool_mode.unwrap_or(false),
         goal_objective: None,
         goal_token_budget: None,
         goal_status: crate::tools::goal::GoalStatus::Active,
@@ -6454,15 +6488,21 @@ async fn run_exec_agent(
             .tag()
             .to_string(),
         workshop: config.workshop.clone(),
-        search_provider: config.search_provider(),
-        search_api_key: config.search.as_ref().and_then(|s| s.api_key.clone()),
-        search_base_url: config.search.as_ref().and_then(|s| s.base_url.clone()),
-        tools_always_load: config.tools_always_load(),
-        tools: config.tools.clone(),
-        verbosity: config.verbosity.clone(),
+        search_provider: execution_config.search_provider(),
+        search_api_key: execution_config
+            .search
+            .as_ref()
+            .and_then(|s| s.api_key.clone()),
+        search_base_url: execution_config
+            .search
+            .as_ref()
+            .and_then(|s| s.base_url.clone()),
+        tools_always_load: execution_config.tools_always_load(),
+        tools: execution_config.tools.clone(),
+        verbosity: execution_config.verbosity.clone(),
     };
 
-    let engine_handle = spawn_engine(engine_config, config);
+    let engine_handle = spawn_engine(engine_config, &execution_config);
     let mode = if auto_approve {
         AppMode::Yolo
     } else {
@@ -6514,7 +6554,7 @@ async fn run_exec_agent(
             reasoning_effort: effective_reasoning_effort,
             reasoning_effort_auto: auto_model,
             auto_model,
-            allow_shell: auto_approve || config.allow_shell(),
+            allow_shell: auto_approve || execution_config.allow_shell(),
             trust_mode,
             auto_approve,
             translation_enabled: false,
@@ -6522,13 +6562,13 @@ async fn run_exec_agent(
             approval_mode: if auto_approve {
                 crate::tui::approval::ApprovalMode::Auto
             } else {
-                config
+                execution_config
                     .approval_policy
                     .as_deref()
                     .and_then(crate::tui::approval::ApprovalMode::from_config_value)
                     .unwrap_or_default()
             },
-            verbosity: config.verbosity.clone(),
+            verbosity: execution_config.verbosity.clone(),
         })
         .await?;
 
@@ -7244,6 +7284,50 @@ mod terminal_mode_tests {
         };
 
         assert_eq!(resolve_exec_model(&config, None), "auto");
+    }
+
+    #[test]
+    fn exec_model_resolution_uses_provider_safe_default_for_zai() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _codewhale_model = crate::test_support::EnvVarGuard::remove("CODEWHALE_MODEL");
+        let _deepseek_model = crate::test_support::EnvVarGuard::remove("DEEPSEEK_MODEL");
+        let config = Config {
+            provider: Some("zai".to_string()),
+            default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_exec_model(&config, None),
+            crate::config::DEFAULT_ZAI_MODEL
+        );
+    }
+
+    #[test]
+    fn cli_route_execution_config_stamps_routed_model_into_provider_slot() {
+        let mut providers = crate::config::ProvidersConfig::default();
+        providers.deepseek.model = Some("deepseek-v4-pro".to_string());
+        let config = Config {
+            provider: Some("deepseek".to_string()),
+            providers: Some(providers),
+            ..Default::default()
+        };
+        let route = CliAutoRoute {
+            provider: crate::config::ApiProvider::Deepseek,
+            model: "deepseek-v4-flash".to_string(),
+            reasoning_effort: None,
+            auto_model: true,
+        };
+
+        let execution_config = config_for_cli_route(&config, &route);
+
+        assert_eq!(execution_config.default_model(), "deepseek-v4-flash");
+        assert_eq!(
+            execution_config
+                .provider_config_for(crate::config::ApiProvider::Deepseek)
+                .and_then(|entry| entry.model.as_deref()),
+            Some("deepseek-v4-flash")
+        );
     }
 
     #[test]

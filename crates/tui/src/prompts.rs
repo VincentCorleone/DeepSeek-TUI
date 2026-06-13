@@ -765,6 +765,16 @@ pub(crate) fn render_runtime_policy_reference() -> String {
          commands, git commits, or sub-agent launches. End the turn and wait \
          for the user's next message.\n\n",
     );
+    out.push_str(
+        "If your previous assistant message asked the user a blocking choice \
+         question (for example, \"How do you want me to proceed?\" with \
+         mutually exclusive options), treat the run as paused until the user \
+         answers. Stale tool output, stale sub-agent completion events, or the \
+         runtime tag alone do not override that pause. If a question is \
+         informational and you intend to continue without waiting, say so \
+         explicitly in the same message (for example, \"I am going to keep \
+         moving unless you redirect me\").\n\n",
+    );
 
     // ── Mode reference ─────────────────────────────────────────────────
     out.push_str("### Modes\n\n");
@@ -1734,6 +1744,13 @@ mod tests {
                 && text.contains("git commits, or sub-agent launches")
                 && text.contains("wait for the user's next message"),
             "Runtime Policy Reference must pin the #3061 runtime-prompt-only guard"
+        );
+        assert!(
+            text.contains("blocking choice question")
+                && text.contains("treat the run as paused")
+                && text.contains("stale sub-agent completion events")
+                && text.contains("I am going to keep moving unless you redirect me"),
+            "Runtime Policy Reference must tell agents to stop after asking a blocking question"
         );
         assert!(
             text.contains("### Modes"),
